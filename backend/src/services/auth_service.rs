@@ -276,11 +276,26 @@ impl AuthService {
         )
         .fetch_optional(&self.db)
         .await
-        .map_err(|e| AppError::Database(e.to_string()))?
-        .ok_or_else(|| AppError::Authentication("Invalid API token".to_string()))?;
+        .map_err(|e| AppError::Database(e.to_string()))?;
 
-        // Verify full token hash
-        if !Self::verify_password(token, &stored_token.token_hash)? {
+        // Always run bcrypt verification to prevent timing-based prefix enumeration
+        // (CWE-208). When no token is found we verify against a dummy hash so the
+        // call site takes the same ~bcrypt-cost time regardless of prefix validity.
+        const DUMMY_TOKEN_HASH: &str =
+            "$2b$12$L9bM5Y91JrjMNH0E6We4Dus/xXhF6gVLHjsP8LlHlyyibxYMRbhjK";
+        let hash_to_verify = stored_token
+            .as_ref()
+            .map(|t| t.token_hash.as_str())
+            .unwrap_or(DUMMY_TOKEN_HASH);
+
+        // Verify full token hash (timing-safe; runs even when prefix not found)
+        let hash_matches = Self::verify_password(token, hash_to_verify)?;
+
+        // Only after the constant-time bcrypt call do we check existence and hash match.
+        let stored_token = stored_token
+            .ok_or_else(|| AppError::Authentication("Invalid API token".to_string()))?;
+
+        if !hash_matches {
             return Err(AppError::Authentication("Invalid API token".to_string()));
         }
 
@@ -1409,5 +1424,41 @@ mod tests {
             .filter(|r| r.as_str() == "developer")
             .count();
         assert_eq!(dev_count, 1, "developer role should not be duplicated");
+    }
+
+    // -----------------------------------------------------------------------
+    // Timing side-channel fix (AKSEC-2026-004): dummy hash must be valid bcrypt
+    // -----------------------------------------------------------------------
+
+    /// The DUMMY_TOKEN_HASH constant used in validate_api_token must be a fully
+    /// valid bcrypt hash so that bcrypt::verify performs the full cost-12 work
+    /// even when no token prefix is found.  If the constant were malformed,
+    /// verify_password would return an Err immediately — exposing the same
+    /// timing oracle the fix is meant to eliminate.
+    #[test]
+    fn test_dummy_token_hash_is_valid_bcrypt_and_never_matches() {
+        const DUMMY_TOKEN_HASH: &str =
+            "$2b$12$L9bM5Y91JrjMNH0E6We4Dus/xXhF6gVLHjsP8LlHlyyibxYMRbhjK";
+
+        // Must not error: bcrypt must be able to process the hash at full cost.
+        let result = AuthService::verify_password("any-random-token-value", DUMMY_TOKEN_HASH);
+        assert!(
+            result.is_ok(),
+            "dummy hash must be valid bcrypt; verify_password returned Err: {:?}",
+            result
+        );
+
+        // Must always return false: the dummy hash must never authenticate any token.
+        assert!(
+            !result.unwrap(),
+            "dummy hash must not match any real token value"
+        );
+
+        // Double-check with a second distinct input to guard against trivially
+        // broken bcrypt implementations that always return true for valid hashes.
+        let result2 =
+            AuthService::verify_password("another-distinct-token-value", DUMMY_TOKEN_HASH);
+        assert!(result2.is_ok(), "dummy hash must be valid bcrypt");
+        assert!(!result2.unwrap(), "dummy hash must not match any real token");
     }
 }
