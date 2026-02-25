@@ -3,6 +3,71 @@
 //! Unit tests for security models that don't require database access.
 
 #[cfg(test)]
+mod admin_password_file_permissions_tests {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    /// Verify that a file created with OpenOptions + mode(0o600) has owner-only
+    /// permissions, regardless of the process umask.
+    ///
+    /// This is a regression test for AKSEC-2026-002: previously std::fs::write()
+    /// was used, which respects the umask (typically 022) and produces 0o644
+    /// (world-readable). The fix uses OpenOptions::mode(0o600) to set permissions
+    /// atomically at creation time.
+    #[test]
+    fn test_password_file_created_with_restrictive_permissions() {
+        let dir = tempfile::tempdir().expect("failed to create tempdir");
+        let path = dir.path().join("admin.password");
+
+        // This is the fixed code path: OpenOptions with explicit mode 0o600
+        std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)
+            .and_then(|mut f| f.write_all(b"supersecret\n"))
+            .expect("failed to write password file");
+
+        let meta = std::fs::metadata(&path).expect("failed to stat file");
+        let mode = meta.permissions().mode() & 0o777;
+
+        assert_eq!(
+            mode, 0o600,
+            "admin.password must be 0o600 (owner read/write only), got {:#o}",
+            mode
+        );
+    }
+
+    /// Demonstrate that std::fs::write() (the old code) produces world-readable
+    /// permissions when the umask is 022, which is the vulnerability being fixed.
+    #[test]
+    fn test_std_fs_write_respects_umask_and_may_be_world_readable() {
+        let dir = tempfile::tempdir().expect("failed to create tempdir");
+        let path = dir.path().join("admin.password.old");
+
+        // Old (vulnerable) code path: std::fs::write() does not set mode
+        std::fs::write(&path, b"supersecret\n").expect("failed to write");
+
+        let meta = std::fs::metadata(&path).expect("failed to stat file");
+        let mode = meta.permissions().mode() & 0o777;
+
+        // With a typical umask of 022, std::fs::write creates files as 0o644 —
+        // world-readable. The mode must NOT be 0o600 (that would mean the old
+        // code was safe, which is the false assumption this test guards against).
+        // Note: in unusual environments the umask may differ, but in CI/Docker
+        // the default umask of 022 produces 0o644.
+        assert_ne!(
+            mode, 0o600,
+            "std::fs::write() should not produce 0o600; if it does the test \
+             environment has an unusually restrictive umask and this finding \
+             would be a false positive"
+        );
+    }
+}
+
+
+#[cfg(test)]
 mod security_model_tests {
     use artifact_keeper_backend::models::security::{Grade, Severity};
 

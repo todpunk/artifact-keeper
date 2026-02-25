@@ -3,6 +3,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::io::Write;
 
 use axum::http::{header, Method};
 use axum::Router;
@@ -745,11 +746,24 @@ async fn provision_admin_user(db: &sqlx::PgPool, storage_path: &str) -> Result<b
             # Do NOT use this password directly in API calls — you must login first.\n",
             password
         );
-        if let Err(e) = std::fs::write(&password_file, &file_contents) {
-            tracing::error!("Failed to write admin password file: {}", e);
-            tracing::error!("Admin password could not be persisted. Re-run the server or check file permissions for: {}", password_file.display());
-        } else {
-            tracing::info!("Admin password written to: {}", password_file.display());
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            match std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&password_file)
+                .and_then(|mut f| f.write_all(file_contents.as_bytes()))
+            {
+                Err(e) => {
+                    tracing::error!("Failed to write admin password file: {}", e);
+                    tracing::error!("Admin password could not be persisted. Re-run the server or check file permissions for: {}", password_file.display());
+                }
+                Ok(_) => {
+                    tracing::info!("Admin password written to: {}", password_file.display());
+                }
+            }
         }
         tracing::info!(
             "\n\
