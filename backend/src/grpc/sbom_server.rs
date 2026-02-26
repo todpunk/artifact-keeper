@@ -194,6 +194,7 @@ impl SbomServiceTrait for SbomGrpcServer {
         &self,
         request: Request<DeleteSbomRequest>,
     ) -> Result<Response<DeleteSbomResponse>, Status> {
+        require_admin(&request)?;
         let req = request.into_inner();
         let id = parse_uuid(&req.id)?;
 
@@ -306,6 +307,7 @@ impl CveHistoryServiceTrait for CveHistoryGrpcServer {
         &self,
         request: Request<UpdateCveStatusRequest>,
     ) -> Result<Response<CveHistoryEntry>, Status> {
+        require_admin(&request)?;
         let req = request.into_inner();
         let id = parse_uuid(&req.id)?;
         let status = proto_to_cve_status(req.status());
@@ -323,6 +325,7 @@ impl CveHistoryServiceTrait for CveHistoryGrpcServer {
         &self,
         request: Request<GetCveTrendsRequest>,
     ) -> Result<Response<CveTrendsResponse>, Status> {
+        require_admin(&request)?;
         let req = request.into_inner();
         let repo_id = if req.repository_id.is_empty() {
             None
@@ -368,6 +371,7 @@ impl CveHistoryServiceTrait for CveHistoryGrpcServer {
         &self,
         request: Request<RetroactiveScanRequest>,
     ) -> Result<Response<RetroactiveScanResponse>, Status> {
+        require_admin(&request)?;
         let _req = request.into_inner();
 
         // TODO: Implement retroactive scan job queuing
@@ -416,6 +420,7 @@ impl SecurityPolicyServiceTrait for SecurityPolicyGrpcServer {
         &self,
         request: Request<UpsertLicensePolicyRequest>,
     ) -> Result<Response<LicensePolicy>, Status> {
+        require_admin(&request)?;
         let req = request.into_inner();
         let policy = req
             .policy
@@ -465,6 +470,7 @@ impl SecurityPolicyServiceTrait for SecurityPolicyGrpcServer {
         &self,
         request: Request<DeleteLicensePolicyRequest>,
     ) -> Result<Response<DeleteLicensePolicyResponse>, Status> {
+        require_admin(&request)?;
         let req = request.into_inner();
         let id = parse_uuid(&req.id)?;
 
@@ -481,6 +487,7 @@ impl SecurityPolicyServiceTrait for SecurityPolicyGrpcServer {
         &self,
         request: Request<ListLicensePoliciesRequest>,
     ) -> Result<Response<ListLicensePoliciesResponse>, Status> {
+        require_admin(&request)?;
         let req = request.into_inner();
 
         let policies: Vec<crate::models::sbom::LicensePolicy> = if req.repository_id.is_empty() {
@@ -506,6 +513,26 @@ impl SecurityPolicyServiceTrait for SecurityPolicyGrpcServer {
             policies: proto_policies,
         }))
     }
+}
+
+// === Authorization helpers ===
+
+/// Enforce that the caller is an administrator.
+///
+/// Reads the `x-is-admin` metadata key injected by [`AuthInterceptor`] and
+/// returns `PERMISSION_DENIED` if the value is not `"true"`.
+#[allow(clippy::result_large_err)]
+fn require_admin<T>(req: &Request<T>) -> Result<(), Status> {
+    let is_admin = req
+        .metadata()
+        .get("x-is-admin")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v == "true")
+        .unwrap_or(false);
+    if !is_admin {
+        return Err(Status::permission_denied("Administrator access required"));
+    }
+    Ok(())
 }
 
 // === Conversion helpers ===
@@ -648,6 +675,37 @@ fn model_policy_action_to_proto(
 mod tests {
     use super::*;
     use chrono::{TimeZone, Utc};
+
+    // -----------------------------------------------------------------------
+    // require_admin
+    // -----------------------------------------------------------------------
+
+    fn request_with_admin_flag(is_admin: &'static str) -> Request<()> {
+        let mut req = Request::new(());
+        req.metadata_mut()
+            .insert("x-is-admin", is_admin.parse().unwrap());
+        req
+    }
+
+    #[test]
+    fn test_require_admin_allows_admin() {
+        let req = request_with_admin_flag("true");
+        assert!(require_admin(&req).is_ok());
+    }
+
+    #[test]
+    fn test_require_admin_rejects_non_admin() {
+        let req = request_with_admin_flag("false");
+        let err = require_admin(&req).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[test]
+    fn test_require_admin_rejects_missing_header() {
+        let req = Request::new(());
+        let err = require_admin(&req).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
 
     // -----------------------------------------------------------------------
     // parse_uuid
