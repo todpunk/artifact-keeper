@@ -22,10 +22,21 @@ impl FilesystemStorage {
         }
     }
 
-    /// Get full path for a key (using first 2 chars as subdirectory for distribution)
+    /// Get full path for a key (using first 2 chars as subdirectory for distribution).
+    ///
+    /// All non-`Normal` path components (e.g. `..`, leading `/`) are stripped before
+    /// building the final path so that a user-controlled key can never escape the
+    /// storage base directory.
     fn key_to_path(&self, key: &str) -> PathBuf {
-        let prefix = &key[..2.min(key.len())];
-        self.base_path.join(prefix).join(key)
+        // Strip "..", absolute-path markers, and any other non-Normal components
+        // to prevent path traversal out of the storage base directory.
+        let sanitized: PathBuf = std::path::Path::new(key)
+            .components()
+            .filter(|c| matches!(c, std::path::Component::Normal(_)))
+            .collect();
+        let sanitized_str = sanitized.to_string_lossy();
+        let prefix = &sanitized_str[..2.min(sanitized_str.len())];
+        self.base_path.join(prefix).join(&sanitized)
     }
 }
 
@@ -190,6 +201,71 @@ mod tests {
 
         let result = storage.delete("nonexistent-key1234").await;
         assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Path traversal protection in key_to_path
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_key_to_path_dotdot_stays_inside_base() {
+        let storage = FilesystemStorage::new("/data");
+        let path = storage.key_to_path("maven/../../etc/passwd");
+        // ".." components must be stripped; path must remain under /data
+        assert!(
+            path.starts_with("/data"),
+            "traversal key must not escape base_path, got {:?}",
+            path
+        );
+    }
+
+    #[test]
+    fn test_key_to_path_absolute_key_stays_inside_base() {
+        let storage = FilesystemStorage::new("/data");
+        let path = storage.key_to_path("/etc/shadow");
+        // Leading "/" (RootDir component) must be stripped
+        assert!(
+            path.starts_with("/data"),
+            "absolute key must not escape base_path, got {:?}",
+            path
+        );
+    }
+
+    #[test]
+    fn test_key_to_path_pure_traversal_stays_inside_base() {
+        let storage = FilesystemStorage::new("/data");
+        // Mimics the AKSEC-2026-013 PoC key after Axum percent-decoding
+        let path = storage.key_to_path("maven/../../../../../tmp/aksec-2026-013-pwned.sha1");
+        assert!(
+            path.starts_with("/data"),
+            "PoC traversal key must not escape base_path, got {:?}",
+            path
+        );
+    }
+
+    #[tokio::test]
+    async fn test_traversal_write_stays_inside_storage() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let storage = FilesystemStorage::new(temp_dir.path());
+
+        // Before the fix this would write to a path outside temp_dir; after the
+        // fix the sanitised key must resolve inside temp_dir.
+        let path = storage.key_to_path("../../escape.txt");
+        assert!(
+            path.starts_with(temp_dir.path()),
+            "key_to_path must stay within base_path, got {:?}",
+            path
+        );
+
+        // The write should succeed (sanitised location inside temp_dir)
+        storage
+            .put("../../escape.txt", Bytes::from_static(b"pwned"))
+            .await
+            .unwrap();
+
+        // And the content must be readable via the same key
+        let content = storage.get("../../escape.txt").await.unwrap();
+        assert_eq!(content, Bytes::from_static(b"pwned"));
     }
 
     #[tokio::test]
