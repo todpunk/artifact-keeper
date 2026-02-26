@@ -67,6 +67,9 @@ pub struct Claims {
     pub exp: i64,
     /// Token type: "access" or "refresh"
     pub token_type: String,
+    /// JWT ID — present only in refresh tokens; used for server-side revocation.
+    #[serde(default)]
+    pub jti: Option<String>,
 }
 
 /// Token pair response
@@ -149,13 +152,17 @@ impl AuthService {
         .map_err(|e| AppError::Database(e.to_string()))?;
 
         // Generate tokens
-        let tokens = self.generate_tokens(&user)?;
+        let tokens = self.generate_tokens(&user).await?;
 
         Ok((user, tokens))
     }
 
-    /// Generate access and refresh tokens for a user
-    pub fn generate_tokens(&self, user: &User) -> Result<TokenPair> {
+    /// Generate access and refresh tokens for a user.
+    ///
+    /// The refresh token is assigned a unique `jti` (JWT ID) that is registered
+    /// in the `refresh_token_allowlist` table. This enables server-side
+    /// revocation via logout or explicit revocation.
+    pub async fn generate_tokens(&self, user: &User) -> Result<TokenPair> {
         let now = Utc::now();
         let access_exp = now + Duration::minutes(self.config.jwt_access_token_expiry_minutes);
         let refresh_exp = now + Duration::days(self.config.jwt_refresh_token_expiry_days);
@@ -168,8 +175,10 @@ impl AuthService {
             iat: now.timestamp(),
             exp: access_exp.timestamp(),
             token_type: "access".to_string(),
+            jti: None,
         };
 
+        let jti = Uuid::new_v4().to_string();
         let refresh_claims = Claims {
             sub: user.id,
             username: user.username.clone(),
@@ -178,6 +187,7 @@ impl AuthService {
             iat: now.timestamp(),
             exp: refresh_exp.timestamp(),
             token_type: "refresh".to_string(),
+            jti: Some(jti.clone()),
         };
 
         let access_token = encode(&Header::default(), &access_claims, &self.encoding_key)
@@ -185,6 +195,18 @@ impl AuthService {
 
         let refresh_token = encode(&Header::default(), &refresh_claims, &self.encoding_key)
             .map_err(|e| AppError::Internal(format!("Token encoding failed: {}", e)))?;
+
+        // Register the new refresh token jti in the allowlist.
+        // Use non-macro query to avoid requiring an updated .sqlx offline cache.
+        sqlx::query(
+            "INSERT INTO refresh_token_allowlist (jti, user_id, expires_at) VALUES ($1, $2, $3)",
+        )
+        .bind(&jti)
+        .bind(user.id)
+        .bind(refresh_exp)
+        .execute(&self.db)
+        .await
+        .map_err(|e| AppError::Database(e.to_string()))?;
 
         Ok(TokenPair {
             access_token,
@@ -204,12 +226,38 @@ impl AuthService {
         Ok(token_data.claims)
     }
 
-    /// Refresh tokens using a refresh token
+    /// Refresh tokens using a refresh token.
+    ///
+    /// Verifies the refresh token's `jti` is present in the allowlist (i.e., has
+    /// not been revoked), atomically removes it, and issues a new token pair whose
+    /// jti is immediately registered.  Tokens without a `jti` (legacy or access
+    /// tokens) are unconditionally rejected.
     pub async fn refresh_tokens(&self, refresh_token: &str) -> Result<(User, TokenPair)> {
         let token_data = self.decode_token(refresh_token)?;
 
         if token_data.claims.token_type != "refresh" {
             return Err(AppError::Authentication("Invalid token type".to_string()));
+        }
+
+        // Reject tokens that carry no jti (pre-revocation tokens or access tokens
+        // mistakenly submitted here).
+        let jti = token_data
+            .claims
+            .jti
+            .ok_or_else(|| AppError::Authentication("Token has been revoked".to_string()))?;
+
+        // Atomically consume the jti.  If zero rows are deleted the token was
+        // already revoked (e.g. by a concurrent logout).
+        let deleted = sqlx::query("DELETE FROM refresh_token_allowlist WHERE jti = $1")
+            .bind(&jti)
+            .execute(&self.db)
+            .await
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        if deleted.rows_affected() == 0 {
+            return Err(AppError::Authentication(
+                "Token has been revoked".to_string(),
+            ));
         }
 
         // Fetch fresh user data
@@ -232,8 +280,23 @@ impl AuthService {
         .map_err(|e| AppError::Database(e.to_string()))?
         .ok_or_else(|| AppError::Authentication("User not found".to_string()))?;
 
-        let tokens = self.generate_tokens(&user)?;
+        let tokens = self.generate_tokens(&user).await?;
         Ok((user, tokens))
+    }
+
+    /// Revoke a refresh token by deleting its jti from the allowlist.
+    ///
+    /// This is a best-effort operation: if the token is malformed, already
+    /// expired, or has no jti, the error is silently ignored.
+    pub async fn revoke_refresh_token(&self, refresh_token: &str) {
+        if let Ok(token_data) = self.decode_token(refresh_token) {
+            if let Some(jti) = token_data.claims.jti {
+                let _ = sqlx::query("DELETE FROM refresh_token_allowlist WHERE jti = $1")
+                    .bind(jti)
+                    .execute(&self.db)
+                    .await;
+            }
+        }
     }
 
     /// Decode and validate a token
@@ -552,7 +615,7 @@ impl AuthService {
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
-        let tokens = self.generate_tokens(&user)?;
+        let tokens = self.generate_tokens(&user).await?;
         Ok((user, tokens))
     }
 
@@ -576,7 +639,7 @@ impl AuthService {
         .await
         .map_err(|e| AppError::Database(e.to_string()))?;
 
-        let tokens = self.generate_tokens(&user)?;
+        let tokens = self.generate_tokens(&user).await?;
         Ok((user, tokens))
     }
 
@@ -926,6 +989,7 @@ impl AuthService {
             iat: now.timestamp(),
             exp: exp.timestamp(),
             token_type: "totp_pending".to_string(),
+            jti: None,
         };
         encode(&Header::default(), &claims, &self.encoding_key)
             .map_err(|e| AppError::Internal(format!("Token encoding failed: {}", e)))
@@ -1084,8 +1148,10 @@ mod tests {
             iat: now.timestamp(),
             exp: access_exp.timestamp(),
             token_type: "access".to_string(),
+            jti: None,
         };
 
+        let jti = Uuid::new_v4().to_string();
         let refresh_claims = Claims {
             sub: user.id,
             username: user.username.clone(),
@@ -1094,6 +1160,7 @@ mod tests {
             iat: now.timestamp(),
             exp: refresh_exp.timestamp(),
             token_type: "refresh".to_string(),
+            jti: Some(jti.clone()),
         };
 
         let access_token = encode(&Header::default(), &access_claims, &encoding_key).unwrap();
@@ -1106,12 +1173,16 @@ mod tests {
         assert_eq!(decoded.claims.username, "testuser");
         assert_eq!(decoded.claims.token_type, "access");
         assert!(!decoded.claims.is_admin);
+        // Access tokens have no jti
+        assert!(decoded.claims.jti.is_none());
 
         // Validate refresh token
         let decoded =
             decode::<Claims>(&refresh_token, &decoding_key, &Validation::default()).unwrap();
         assert_eq!(decoded.claims.sub, user.id);
         assert_eq!(decoded.claims.token_type, "refresh");
+        // Refresh tokens carry a jti for server-side revocation
+        assert_eq!(decoded.claims.jti.as_deref(), Some(jti.as_str()));
     }
 
     #[test]
@@ -1130,6 +1201,7 @@ mod tests {
             iat: now.timestamp(),
             exp: (now + Duration::days(7)).timestamp(),
             token_type: "refresh".to_string(),
+            jti: Some(Uuid::new_v4().to_string()),
         };
 
         let token = encode(&Header::default(), &refresh_claims, &encoding_key).unwrap();
@@ -1156,6 +1228,7 @@ mod tests {
             iat: (now - Duration::hours(2)).timestamp(),
             exp: (now - Duration::hours(1)).timestamp(), // expired 1 hour ago
             token_type: "access".to_string(),
+            jti: None,
         };
 
         let token = encode(&Header::default(), &claims, &encoding_key).unwrap();
@@ -1177,6 +1250,7 @@ mod tests {
             iat: now.timestamp(),
             exp: (now + Duration::hours(1)).timestamp(),
             token_type: "access".to_string(),
+            jti: None,
         };
 
         let token = encode(&Header::default(), &claims, &encoding_key).unwrap();
@@ -1199,6 +1273,7 @@ mod tests {
             iat: 1000,
             exp: 2000,
             token_type: "access".to_string(),
+            jti: None,
         };
 
         let json = serde_json::to_string(&claims).unwrap();
@@ -1409,5 +1484,98 @@ mod tests {
             .filter(|r| r.as_str() == "developer")
             .count();
         assert_eq!(dev_count, 1, "developer role should not be duplicated");
+    }
+
+    // -----------------------------------------------------------------------
+    // Refresh token revocation — jti presence (AKSEC-2026-062)
+    // -----------------------------------------------------------------------
+
+    /// Refresh token Claims must carry a jti so the server can revoke them.
+    /// Before the fix, Claims had no jti field; tokens encoded without one
+    /// would be accepted by refresh_tokens() with no revocation check.
+    #[test]
+    fn test_refresh_claims_carry_jti() {
+        let config = make_test_config();
+        let encoding_key = EncodingKey::from_secret(config.jwt_secret.as_bytes());
+        let decoding_key = DecodingKey::from_secret(config.jwt_secret.as_bytes());
+
+        let now = Utc::now();
+        let jti = Uuid::new_v4().to_string();
+        let refresh_claims = Claims {
+            sub: Uuid::new_v4(),
+            username: "alice".to_string(),
+            email: "alice@example.com".to_string(),
+            is_admin: false,
+            iat: now.timestamp(),
+            exp: (now + Duration::days(7)).timestamp(),
+            token_type: "refresh".to_string(),
+            jti: Some(jti.clone()),
+        };
+
+        let token = encode(&Header::default(), &refresh_claims, &encoding_key).unwrap();
+        let decoded = decode::<Claims>(&token, &decoding_key, &Validation::default()).unwrap();
+
+        // The jti must survive the encode → decode round-trip.
+        assert_eq!(
+            decoded.claims.jti.as_deref(),
+            Some(jti.as_str()),
+            "refresh token must carry a jti for server-side revocation"
+        );
+    }
+
+    /// Access token Claims must NOT carry a jti.  refresh_tokens() rejects
+    /// tokens with jti == None, so an access token submitted to /auth/refresh
+    /// is automatically refused even if its signature is valid.
+    #[test]
+    fn test_access_claims_have_no_jti() {
+        let config = make_test_config();
+        let encoding_key = EncodingKey::from_secret(config.jwt_secret.as_bytes());
+        let decoding_key = DecodingKey::from_secret(config.jwt_secret.as_bytes());
+
+        let now = Utc::now();
+        let access_claims = Claims {
+            sub: Uuid::new_v4(),
+            username: "bob".to_string(),
+            email: "bob@example.com".to_string(),
+            is_admin: false,
+            iat: now.timestamp(),
+            exp: (now + Duration::minutes(30)).timestamp(),
+            token_type: "access".to_string(),
+            jti: None,
+        };
+
+        let token = encode(&Header::default(), &access_claims, &encoding_key).unwrap();
+        let decoded = decode::<Claims>(&token, &decoding_key, &Validation::default()).unwrap();
+
+        assert!(
+            decoded.claims.jti.is_none(),
+            "access tokens must not carry a jti"
+        );
+    }
+
+    /// A Claims decoded from a token that predates the jti field (no "jti" key
+    /// in the JSON payload) must deserialise with jti == None rather than
+    /// failing.  refresh_tokens() will then reject it as "Token has been
+    /// revoked", which is the correct post-fix behaviour for legacy tokens.
+    #[test]
+    fn test_legacy_refresh_token_without_jti_deserializes_as_none() {
+        // Encode a raw JSON payload that has no "jti" key, simulating a token
+        // issued before the fix was deployed.
+        let payload = serde_json::json!({
+            "sub": Uuid::new_v4().to_string(),
+            "username": "legacy",
+            "email": "legacy@example.com",
+            "is_admin": false,
+            "iat": 1_700_000_000_i64,
+            "exp": 9_999_999_999_i64,
+            "token_type": "refresh"
+            // no "jti" field
+        });
+        let claims: Claims = serde_json::from_value(payload).unwrap();
+        assert!(
+            claims.jti.is_none(),
+            "legacy refresh tokens without jti must deserialise as jti=None \
+             so that refresh_tokens() rejects them as revoked"
+        );
     }
 }

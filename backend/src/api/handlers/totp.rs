@@ -325,7 +325,7 @@ pub async fn verify_totp(
     .await
     .map_err(|e| AppError::Database(e.to_string()))?;
 
-    let tokens = auth_service.generate_tokens(&user)?;
+    let tokens = auth_service.generate_tokens(&user).await?;
 
     let body = super::auth::LoginResponse {
         access_token: tokens.access_token.clone(),

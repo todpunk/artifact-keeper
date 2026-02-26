@@ -175,7 +175,13 @@ pub async fn login(
         (status = 200, description = "Logout successful, auth cookies cleared"),
     )
 )]
-pub async fn logout(State(_state): State<SharedState>) -> Result<Response> {
+pub async fn logout(State(state): State<SharedState>, headers: HeaderMap) -> Result<Response> {
+    // Revoke the refresh token's jti so it cannot be used after logout.
+    // Best-effort: errors (malformed token, already expired, no jti) are ignored.
+    if let Some(rt) = extract_cookie(&headers, "ak_refresh_token") {
+        let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
+        auth_service.revoke_refresh_token(rt).await;
+    }
     let mut response = ().into_response();
     clear_auth_cookies(response.headers_mut());
     Ok(response)
@@ -362,10 +368,11 @@ pub(crate) fn set_auth_cookies(
         "ak_access_token={}; HttpOnly;{} SameSite=Strict; Path=/; Max-Age={}",
         access_token, flag, expires_in
     );
-    let refresh_cookie =
-        format!(
-        "ak_refresh_token={}; HttpOnly;{} SameSite=Strict; Path=/api/v1/auth/refresh; Max-Age={}",
-        refresh_token, flag, 7 * 24 * 3600
+    let refresh_cookie = format!(
+        "ak_refresh_token={}; HttpOnly;{} SameSite=Strict; Path=/api/v1/auth; Max-Age={}",
+        refresh_token,
+        flag,
+        7 * 24 * 3600
     );
     headers.append(SET_COOKIE, access_cookie.parse().unwrap());
     headers.append(SET_COOKIE, refresh_cookie.parse().unwrap());
@@ -379,7 +386,7 @@ fn clear_auth_cookies(headers: &mut HeaderMap) {
         flag
     );
     let clear_refresh = format!(
-        "ak_refresh_token=; HttpOnly;{} SameSite=Strict; Path=/api/v1/auth/refresh; Max-Age=0",
+        "ak_refresh_token=; HttpOnly;{} SameSite=Strict; Path=/api/v1/auth; Max-Age=0",
         flag
     );
     headers.append(SET_COOKIE, clear_access.parse().unwrap());
@@ -825,7 +832,7 @@ mod tests {
             .find(|c| c.contains("ak_refresh_token="))
             .unwrap();
         assert!(refresh_cookie.contains("ak_refresh_token=ref"));
-        assert!(refresh_cookie.contains("Path=/api/v1/auth/refresh"));
+        assert!(refresh_cookie.contains("Path=/api/v1/auth"));
         // 7 days in seconds
         assert!(refresh_cookie.contains("Max-Age=604800"));
     }

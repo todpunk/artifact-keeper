@@ -248,7 +248,7 @@ async fn token(
                     }
                 };
 
-                let tokens = match auth_service.generate_tokens(&user) {
+                let tokens = match auth_service.generate_tokens(&user).await {
                     Ok(t) => t,
                     Err(_) => {
                         return oci_error(

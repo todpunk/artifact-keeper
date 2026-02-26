@@ -474,6 +474,7 @@ mod tests {
             iat: 1000,
             exp: 2000,
             token_type: "access".to_string(),
+            jti: None,
         };
 
         let ext = AuthExtension::from(claims);
@@ -495,6 +496,7 @@ mod tests {
             iat: 1000,
             exp: 2000,
             token_type: "access".to_string(),
+            jti: None,
         };
 
         let ext = AuthExtension::from(claims);
