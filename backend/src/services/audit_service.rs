@@ -650,4 +650,43 @@ mod tests {
         let cloned = rt;
         assert_eq!(rt.as_str(), cloned.as_str());
     }
+
+    // -----------------------------------------------------------------------
+    // Login handler audit entry construction (AKSEC-2026-060)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_login_failed_audit_entry_fields() {
+        // Verify the exact entry shape emitted by the login handler on failure.
+        let entry = AuditEntry::new(AuditAction::LoginFailed, ResourceType::User).details(
+            serde_json::json!({
+                "username": "attacker",
+                "reason": "authentication_failed"
+            }),
+        );
+        assert!(entry.user_id.is_none()); // no user_id — subject may not exist
+        assert_eq!(entry.action.as_str(), "LOGIN_FAILED");
+        assert_eq!(entry.resource_type.as_str(), "user");
+        let details = entry.details.unwrap();
+        assert_eq!(details["username"], "attacker");
+        assert_eq!(details["reason"], "authentication_failed");
+    }
+
+    #[test]
+    fn test_login_success_audit_entry_fields() {
+        // Verify the exact entry shape emitted by the login handler on success.
+        let user_id = Uuid::new_v4();
+        let entry = AuditEntry::new(AuditAction::Login, ResourceType::User)
+            .user(user_id)
+            .details(serde_json::json!({
+                "username": "alice",
+                "method": "password"
+            }));
+        assert_eq!(entry.user_id, Some(user_id));
+        assert_eq!(entry.action.as_str(), "LOGIN");
+        assert_eq!(entry.resource_type.as_str(), "user");
+        let details = entry.details.unwrap();
+        assert_eq!(details["username"], "alice");
+        assert_eq!(details["method"], "password");
+    }
 }

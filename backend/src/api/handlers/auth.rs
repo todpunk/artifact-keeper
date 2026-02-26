@@ -17,6 +17,7 @@ use uuid::Uuid;
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
 use crate::error::{AppError, Result};
+use crate::services::audit_service::{AuditAction, AuditEntry, AuditService, ResourceType};
 use crate::services::auth_config_service::AuthConfigService;
 use crate::services::auth_service::AuthService;
 use std::sync::atomic::Ordering;
@@ -125,10 +126,24 @@ pub async fn login(
     }
 
     let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
+    let audit_service = AuditService::new(state.db.clone());
 
-    let (user, tokens) = auth_service
+    let (user, tokens) = match auth_service
         .authenticate(&payload.username, &payload.password)
-        .await?;
+        .await
+    {
+        Ok(result) => result,
+        Err(e) => {
+            let entry = AuditEntry::new(AuditAction::LoginFailed, ResourceType::User).details(
+                serde_json::json!({
+                    "username": payload.username,
+                    "reason": "authentication_failed"
+                }),
+            );
+            let _ = audit_service.log(entry).await;
+            return Err(e);
+        }
+    };
 
     // If TOTP is enabled, return a pending token instead of real tokens
     if user.totp_enabled {
@@ -144,6 +159,14 @@ pub async fn login(
         };
         return Ok(Json(body).into_response());
     }
+
+    let entry = AuditEntry::new(AuditAction::Login, ResourceType::User)
+        .user(user.id)
+        .details(serde_json::json!({
+            "username": payload.username,
+            "method": "password"
+        }));
+    let _ = audit_service.log(entry).await;
 
     let body = LoginResponse {
         access_token: tokens.access_token.clone(),
