@@ -176,11 +176,14 @@ pub async fn login(
     )
 )]
 pub async fn logout(State(state): State<SharedState>, headers: HeaderMap) -> Result<Response> {
-    // Revoke the refresh token's jti so it cannot be used after logout.
-    // Best-effort: errors (malformed token, already expired, no jti) are ignored.
+    let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
+    // Revoke the refresh token's jti so it cannot mint new access tokens after logout.
     if let Some(rt) = extract_cookie(&headers, "ak_refresh_token") {
-        let auth_service = AuthService::new(state.db.clone(), Arc::new(state.config.clone()));
         auth_service.revoke_refresh_token(rt).await;
+    }
+    // Revoke the access token's jti so a stolen token cannot be replayed post-logout.
+    if let Some(at) = extract_cookie(&headers, "ak_access_token") {
+        auth_service.revoke_access_token(at).await;
     }
     let mut response = ().into_response();
     clear_auth_cookies(response.headers_mut());

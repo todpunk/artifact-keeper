@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use bcrypt::{hash, verify, DEFAULT_COST};
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, TokenData, Validation};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
@@ -159,14 +159,16 @@ impl AuthService {
 
     /// Generate access and refresh tokens for a user.
     ///
-    /// The refresh token is assigned a unique `jti` (JWT ID) that is registered
-    /// in the `refresh_token_allowlist` table. This enables server-side
-    /// revocation via logout or explicit revocation.
+    /// The access token is assigned a unique `jti` that is registered in the
+    /// `access_token_blocklist` on logout, enabling stolen tokens to be
+    /// invalidated within their 30-minute window.  The refresh token's `jti`
+    /// is registered in the `refresh_token_allowlist` table as before.
     pub async fn generate_tokens(&self, user: &User) -> Result<TokenPair> {
         let now = Utc::now();
         let access_exp = now + Duration::minutes(self.config.jwt_access_token_expiry_minutes);
         let refresh_exp = now + Duration::days(self.config.jwt_refresh_token_expiry_days);
 
+        let access_jti = Uuid::new_v4().to_string();
         let access_claims = Claims {
             sub: user.id,
             username: user.username.clone(),
@@ -175,7 +177,7 @@ impl AuthService {
             iat: now.timestamp(),
             exp: access_exp.timestamp(),
             token_type: "access".to_string(),
-            jti: None,
+            jti: Some(access_jti.clone()),
         };
 
         let jti = Uuid::new_v4().to_string();
@@ -297,6 +299,46 @@ impl AuthService {
                     .await;
             }
         }
+    }
+
+    /// Revoke an access token by inserting its jti into the blocklist.
+    ///
+    /// Best-effort: silently ignored if the token is malformed or has no jti.
+    /// Allows recently-expired tokens (validate_exp = false) so that logout
+    /// near the expiry boundary still revokes the token.
+    pub async fn revoke_access_token(&self, access_token: &str) {
+        let mut validation = Validation::default();
+        validation.validate_exp = false;
+        if let Ok(token_data) = decode::<Claims>(access_token, &self.decoding_key, &validation) {
+            if let Some(jti) = token_data.claims.jti {
+                let expires_at = DateTime::<Utc>::from_timestamp(token_data.claims.exp, 0)
+                    .unwrap_or_else(Utc::now);
+                let _ = sqlx::query(
+                    "INSERT INTO access_token_blocklist (jti, user_id, expires_at) \
+                     VALUES ($1, $2, $3) ON CONFLICT (jti) DO NOTHING",
+                )
+                .bind(&jti)
+                .bind(token_data.claims.sub)
+                .bind(expires_at)
+                .execute(&self.db)
+                .await;
+            }
+        }
+    }
+
+    /// Check whether an access token JTI has been revoked (is in the blocklist).
+    ///
+    /// Returns `Ok(false)` on database errors so that a transient DB failure
+    /// does not lock out all users — the 30-minute access-token window is the
+    /// last line of defence in that scenario.
+    pub async fn is_access_token_revoked(&self, jti: &str) -> bool {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM access_token_blocklist WHERE jti = $1)",
+        )
+        .bind(jti)
+        .fetch_one(&self.db)
+        .await
+        .unwrap_or(false)
     }
 
     /// Decode and validate a token
@@ -1523,16 +1565,17 @@ mod tests {
         );
     }
 
-    /// Access token Claims must NOT carry a jti.  refresh_tokens() rejects
-    /// tokens with jti == None, so an access token submitted to /auth/refresh
-    /// is automatically refused even if its signature is valid.
+    /// Access token Claims must carry a jti (AKSEC-2026-063).
+    /// This jti is inserted into the access_token_blocklist on logout so that
+    /// a stolen token cannot be replayed within its 30-minute validity window.
     #[test]
-    fn test_access_claims_have_no_jti() {
+    fn test_access_claims_carry_jti() {
         let config = make_test_config();
         let encoding_key = EncodingKey::from_secret(config.jwt_secret.as_bytes());
         let decoding_key = DecodingKey::from_secret(config.jwt_secret.as_bytes());
 
         let now = Utc::now();
+        let jti = Uuid::new_v4().to_string();
         let access_claims = Claims {
             sub: Uuid::new_v4(),
             username: "bob".to_string(),
@@ -1541,15 +1584,16 @@ mod tests {
             iat: now.timestamp(),
             exp: (now + Duration::minutes(30)).timestamp(),
             token_type: "access".to_string(),
-            jti: None,
+            jti: Some(jti.clone()),
         };
 
         let token = encode(&Header::default(), &access_claims, &encoding_key).unwrap();
         let decoded = decode::<Claims>(&token, &decoding_key, &Validation::default()).unwrap();
 
-        assert!(
-            decoded.claims.jti.is_none(),
-            "access tokens must not carry a jti"
+        assert_eq!(
+            decoded.claims.jti.as_deref(),
+            Some(jti.as_str()),
+            "access token must carry a jti for server-side revocation on logout"
         );
     }
 
@@ -1576,6 +1620,62 @@ mod tests {
             claims.jti.is_none(),
             "legacy refresh tokens without jti must deserialise as jti=None \
              so that refresh_tokens() rejects them as revoked"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Access token revocation — jti blocklist (AKSEC-2026-063)
+    // -----------------------------------------------------------------------
+
+    /// Access tokens now carry a jti and each token gets a unique one.
+    /// Two tokens issued for the same user must have different JTIs so that
+    /// revoking one does not affect the other.
+    #[test]
+    fn test_access_token_jtis_are_unique() {
+        let now = Utc::now();
+        let user_id = Uuid::new_v4();
+
+        let claims_a = Claims {
+            sub: user_id,
+            username: "alice".to_string(),
+            email: "alice@example.com".to_string(),
+            is_admin: false,
+            iat: now.timestamp(),
+            exp: (now + Duration::minutes(30)).timestamp(),
+            token_type: "access".to_string(),
+            jti: Some(Uuid::new_v4().to_string()),
+        };
+        let claims_b = Claims {
+            jti: Some(Uuid::new_v4().to_string()),
+            ..claims_a.clone()
+        };
+
+        assert_ne!(
+            claims_a.jti, claims_b.jti,
+            "each access token must have a unique jti so individual revocation is possible"
+        );
+    }
+
+    /// A legacy access token without a jti (issued before this fix) must
+    /// deserialise successfully with jti == None.  The middleware treats a
+    /// None jti as not-in-blocklist (cannot be individually revoked, but will
+    /// expire naturally within 30 minutes).
+    #[test]
+    fn test_legacy_access_token_without_jti_deserializes_as_none() {
+        let payload = serde_json::json!({
+            "sub": Uuid::new_v4().to_string(),
+            "username": "legacy",
+            "email": "legacy@example.com",
+            "is_admin": false,
+            "iat": 1_700_000_000_i64,
+            "exp": 9_999_999_999_i64,
+            "token_type": "access"
+            // no "jti" field — pre-063 token
+        });
+        let claims: Claims = serde_json::from_value(payload).unwrap();
+        assert!(
+            claims.jti.is_none(),
+            "legacy access tokens without jti must deserialise as jti=None"
         );
     }
 }

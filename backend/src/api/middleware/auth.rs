@@ -180,6 +180,13 @@ pub async fn auth_middleware(
             // Try JWT token first for Bearer scheme
             match auth_service.validate_access_token(token) {
                 Ok(claims) => {
+                    // Reject tokens that were revoked on logout
+                    if let Some(jti) = &claims.jti {
+                        if auth_service.is_access_token_revoked(jti).await {
+                            return (StatusCode::UNAUTHORIZED, "Token has been revoked")
+                                .into_response();
+                        }
+                    }
                     request.extensions_mut().insert(AuthExtension::from(claims));
                     next.run(request).await
                 }
@@ -256,7 +263,15 @@ pub async fn optional_auth_middleware(
     let auth_ext = match extracted {
         ExtractedToken::Bearer(token) => {
             if let Ok(claims) = auth_service.validate_access_token(token) {
-                Some(AuthExtension::from(claims))
+                let revoked = match &claims.jti {
+                    Some(jti) => auth_service.is_access_token_revoked(jti).await,
+                    None => false,
+                };
+                if revoked {
+                    None
+                } else {
+                    Some(AuthExtension::from(claims))
+                }
             } else {
                 validate_api_token_with_scopes(&auth_service, token)
                     .await
@@ -286,7 +301,15 @@ pub async fn admin_middleware(
 
     let auth_ext = match extracted {
         ExtractedToken::Bearer(token) => match auth_service.validate_access_token(token) {
-            Ok(claims) => AuthExtension::from(claims),
+            Ok(claims) => {
+                if let Some(jti) = &claims.jti {
+                    if auth_service.is_access_token_revoked(jti).await {
+                        return (StatusCode::UNAUTHORIZED, "Token has been revoked")
+                            .into_response();
+                    }
+                }
+                AuthExtension::from(claims)
+            }
             Err(_) => match validate_api_token_with_scopes(&auth_service, token).await {
                 Ok(ext) => ext,
                 Err(_) => {
