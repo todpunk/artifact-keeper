@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
-use crate::error::Result;
+use crate::error::{AppError, Result};
 use crate::services::peer_instance_service::{
     InstanceStatus, PeerInstanceService, RegisterPeerInstanceRequest as ServiceRegisterReq,
     ReplicationMode,
@@ -570,7 +570,13 @@ async fn announce_peer(
     ),
     security(("bearer_auth" = []))
 )]
-async fn get_identity(State(state): State<SharedState>) -> Result<Json<IdentityResponse>> {
+async fn get_identity(
+    State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
+) -> Result<Json<IdentityResponse>> {
+    if !auth.is_admin {
+        return Err(AppError::Authorization("Admin access required".to_string()));
+    }
     let svc = PeerInstanceService::new(state.db.clone());
     let local = svc.get_local_instance().await?;
 
@@ -1030,5 +1036,46 @@ mod tests {
     fn test_sync_tasks_limit_default() {
         let limit = 50_u32 as i64;
         assert_eq!(limit, 50);
+    }
+
+    // -----------------------------------------------------------------------
+    // get_identity admin guard
+    // -----------------------------------------------------------------------
+
+    fn make_auth(is_admin: bool) -> AuthExtension {
+        AuthExtension {
+            user_id: Uuid::new_v4(),
+            username: "testuser".to_string(),
+            email: "testuser@example.com".to_string(),
+            is_admin,
+            is_api_token: false,
+            is_service_account: false,
+            scopes: None,
+            allowed_repo_ids: None,
+        }
+    }
+
+    #[test]
+    fn test_get_identity_non_admin_returns_authorization_error() {
+        let auth = make_auth(false);
+        let result: Result<()> = if !auth.is_admin {
+            Err(AppError::Authorization("Admin access required".to_string()))
+        } else {
+            Ok(())
+        };
+        assert!(
+            matches!(result, Err(AppError::Authorization(ref msg)) if msg == "Admin access required")
+        );
+    }
+
+    #[test]
+    fn test_get_identity_admin_passes_guard() {
+        let auth = make_auth(true);
+        let result: Result<()> = if !auth.is_admin {
+            Err(AppError::Authorization("Admin access required".to_string()))
+        } else {
+            Ok(())
+        };
+        assert!(result.is_ok());
     }
 }
