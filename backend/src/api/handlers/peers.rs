@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use crate::api::middleware::auth::AuthExtension;
 use crate::api::SharedState;
-use crate::error::Result;
+use crate::error::{AppError, Result};
 use crate::services::peer_instance_service::{
     InstanceStatus, PeerInstanceService, RegisterPeerInstanceRequest as ServiceRegisterReq,
     ReplicationMode,
@@ -531,14 +531,22 @@ pub async fn unassign_repo(
     request_body = AnnouncePeerRequest,
     responses(
         (status = 200, description = "Peer announcement accepted", body = Object),
+        (status = 401, description = "Admin privileges required"),
         (status = 500, description = "Internal server error")
     ),
     security(("bearer_auth" = []))
 )]
 async fn announce_peer(
     State(state): State<SharedState>,
+    Extension(auth): Extension<AuthExtension>,
     Json(body): Json<AnnouncePeerRequest>,
 ) -> Result<Json<serde_json::Value>> {
+    if !auth.is_admin {
+        return Err(AppError::Unauthorized(
+            "Admin privileges required".to_string(),
+        ));
+    }
+
     let peer_svc = PeerService::new(state.db.clone());
     let instance_svc = PeerInstanceService::new(state.db.clone());
     let local = instance_svc.get_local_instance().await?;
@@ -1030,5 +1038,55 @@ mod tests {
     fn test_sync_tasks_limit_default() {
         let limit = 50_u32 as i64;
         assert_eq!(limit, 50);
+    }
+
+    // -----------------------------------------------------------------------
+    // announce_peer admin guard
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_announce_peer_non_admin_rejected() {
+        // Replicate the guard logic: non-admin auth must produce Unauthorized.
+        let auth = AuthExtension {
+            user_id: Uuid::nil(),
+            username: "attacker".to_string(),
+            email: "attacker@example.com".to_string(),
+            is_admin: false,
+            is_api_token: false,
+            is_service_account: false,
+            scopes: None,
+            allowed_repo_ids: None,
+        };
+        let result: Result<()> = if !auth.is_admin {
+            Err(AppError::Unauthorized(
+                "Admin privileges required".to_string(),
+            ))
+        } else {
+            Ok(())
+        };
+        assert!(matches!(result, Err(AppError::Unauthorized(_))));
+    }
+
+    #[test]
+    fn test_announce_peer_admin_passes_guard() {
+        // Admin auth must pass the guard without error.
+        let auth = AuthExtension {
+            user_id: Uuid::nil(),
+            username: "admin".to_string(),
+            email: "admin@example.com".to_string(),
+            is_admin: true,
+            is_api_token: false,
+            is_service_account: false,
+            scopes: None,
+            allowed_repo_ids: None,
+        };
+        let result: Result<()> = if !auth.is_admin {
+            Err(AppError::Unauthorized(
+                "Admin privileges required".to_string(),
+            ))
+        } else {
+            Ok(())
+        };
+        assert!(result.is_ok());
     }
 }
