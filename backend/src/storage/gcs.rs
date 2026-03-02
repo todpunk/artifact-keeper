@@ -1,8 +1,11 @@
-//! Google Cloud Storage backend with signed URL support.
+//! Google Cloud Storage backend with signed URL and Workload Identity support.
 //!
-//! Supports redirect downloads via V4 signed URLs.
+//! Supports two authentication modes:
 //!
-//! ## Configuration
+//! ## Mode A — RSA key signing (V4 signed URLs)
+//!
+//! Triggered when `GCS_PRIVATE_KEY` or `GCS_PRIVATE_KEY_PATH` is set. Requires
+//! `GCS_PROJECT_ID` and `GCS_SERVICE_ACCOUNT_EMAIL`.
 //!
 //! ```bash
 //! STORAGE_BACKEND=gcs
@@ -14,7 +17,22 @@
 //! GCS_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\n..."
 //! GCS_REDIRECT_DOWNLOADS=true
 //! GCS_SIGNED_URL_EXPIRY=3600  # seconds, default 1 hour
+//! ```
 //!
+//! ## Mode B — Application Default Credentials / Workload Identity
+//!
+//! Triggered when neither `GCS_PRIVATE_KEY` nor `GCS_PRIVATE_KEY_PATH` is set.
+//! Authenticates via the GCP metadata server (works on GKE with Workload Identity).
+//! Only `GCS_BUCKET` is required. `supports_redirect()` returns `false` in this mode.
+//!
+//! ```bash
+//! STORAGE_BACKEND=gcs
+//! GCS_BUCKET=my-bucket
+//! ```
+//!
+//! ## Path format
+//!
+//! ```bash
 //! # For Artifactory migration:
 //! STORAGE_PATH_FORMAT=migration  # native, artifactory, or migration
 //! ```
@@ -27,20 +45,40 @@ use rsa::sha2::Sha256;
 use rsa::signature::{SignatureEncoding, Signer};
 use rsa::RsaPrivateKey;
 use sha2::Digest;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use tokio::sync::RwLock;
 
 use crate::error::{AppError, Result};
 use crate::storage::{PresignedUrl, PresignedUrlSource, StorageBackend, StoragePathFormat};
+
+/// GCP metadata server URL for fetching access tokens.
+const GCP_METADATA_TOKEN_URL: &str =
+    "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token";
+
+/// Authentication mode for GCS operations.
+#[derive(Debug)]
+enum AuthMode {
+    /// RSA key signing — V4 signed URLs for get/exists; unauthenticated put/delete (Mode A).
+    RsaKey,
+    /// Application Default Credentials via the GCP metadata server (Mode B).
+    Adc,
+}
+
+/// Cached GCP access token for ADC mode.
+struct CachedToken {
+    token: String,
+    expires_at: Instant,
+}
 
 /// Google Cloud Storage configuration
 #[derive(Debug, Clone)]
 pub struct GcsConfig {
     /// GCS bucket name
     pub bucket: String,
-    /// GCP project ID
-    pub project_id: String,
-    /// Service account email
-    pub service_account_email: String,
+    /// GCP project ID (required in Mode A / RSA key signing, optional in ADC mode)
+    pub project_id: Option<String>,
+    /// Service account email (required in Mode A / RSA key signing, optional in ADC mode)
+    pub service_account_email: Option<String>,
     /// RSA private key (PEM format)
     pub private_key: Option<String>,
     /// Enable redirect downloads via signed URLs
@@ -52,18 +90,20 @@ pub struct GcsConfig {
 }
 
 impl GcsConfig {
-    /// Create config from environment variables
+    /// Create config from environment variables.
+    ///
+    /// `GCS_BUCKET` is always required.
+    ///
+    /// When `GCS_PRIVATE_KEY` or `GCS_PRIVATE_KEY_PATH` is set (Mode A), both
+    /// `GCS_PROJECT_ID` and `GCS_SERVICE_ACCOUNT_EMAIL` are also required.
+    ///
+    /// When neither key variable is set (Mode B / ADC), `GCS_PROJECT_ID` and
+    /// `GCS_SERVICE_ACCOUNT_EMAIL` are optional and may be omitted.
     pub fn from_env() -> Result<Self> {
         let bucket = std::env::var("GCS_BUCKET")
             .map_err(|_| AppError::Config("GCS_BUCKET not set".to_string()))?;
 
-        let project_id = std::env::var("GCS_PROJECT_ID")
-            .map_err(|_| AppError::Config("GCS_PROJECT_ID not set".to_string()))?;
-
-        let service_account_email = std::env::var("GCS_SERVICE_ACCOUNT_EMAIL")
-            .map_err(|_| AppError::Config("GCS_SERVICE_ACCOUNT_EMAIL not set".to_string()))?;
-
-        // Load private key from file or environment
+        // Load private key from file or environment variable
         let private_key = if let Ok(key_path) = std::env::var("GCS_PRIVATE_KEY_PATH") {
             std::fs::read_to_string(&key_path)
                 .map_err(|e| {
@@ -74,6 +114,24 @@ impl GcsConfig {
         } else {
             std::env::var("GCS_PRIVATE_KEY").ok()
         };
+
+        let project_id = std::env::var("GCS_PROJECT_ID").ok();
+        let service_account_email = std::env::var("GCS_SERVICE_ACCOUNT_EMAIL").ok();
+
+        // In Mode A (private key present), project_id and service_account_email are required
+        if private_key.is_some() {
+            if project_id.is_none() {
+                return Err(AppError::Config(
+                    "GCS_PROJECT_ID not set (required when using RSA key signing)".to_string(),
+                ));
+            }
+            if service_account_email.is_none() {
+                return Err(AppError::Config(
+                    "GCS_SERVICE_ACCOUNT_EMAIL not set (required when using RSA key signing)"
+                        .to_string(),
+                ));
+            }
+        }
 
         let redirect_downloads = std::env::var("GCS_REDIRECT_DOWNLOADS")
             .map(|v| v.to_lowercase() == "true" || v == "1")
@@ -123,6 +181,8 @@ pub struct GcsBackend {
     client: reqwest::Client,
     signing_key: Option<RsaPrivateKey>,
     path_format: StoragePathFormat,
+    auth_mode: AuthMode,
+    token_cache: RwLock<Option<CachedToken>>,
 }
 
 impl GcsBackend {
@@ -138,6 +198,12 @@ impl GcsBackend {
             Some(key)
         } else {
             None
+        };
+
+        let auth_mode = if signing_key.is_some() {
+            AuthMode::RsaKey
+        } else {
+            AuthMode::Adc
         };
 
         let client = reqwest::Client::builder()
@@ -159,7 +225,71 @@ impl GcsBackend {
             client,
             signing_key,
             path_format,
+            auth_mode,
+            token_cache: RwLock::new(None),
         })
+    }
+
+    /// Fetch a GCP access token, using a cached value if still fresh.
+    ///
+    /// Tokens are proactively refreshed 60 seconds before their reported expiry.
+    async fn get_token(&self) -> Result<String> {
+        // Fast path: check cache under read lock
+        {
+            let cache = self.token_cache.read().await;
+            if let Some(ref cached) = *cache {
+                if cached.expires_at > Instant::now() + Duration::from_secs(60) {
+                    return Ok(cached.token.clone());
+                }
+            }
+        }
+
+        // Slow path: refresh under write lock
+        let mut cache = self.token_cache.write().await;
+        // Double-check — another task may have refreshed while we waited for the write lock
+        if let Some(ref cached) = *cache {
+            if cached.expires_at > Instant::now() + Duration::from_secs(60) {
+                return Ok(cached.token.clone());
+            }
+        }
+
+        #[derive(serde::Deserialize)]
+        struct TokenResponse {
+            access_token: String,
+            expires_in: u64,
+        }
+
+        let response = self
+            .client
+            .get(GCP_METADATA_TOKEN_URL)
+            .header("Metadata-Flavor", "Google")
+            .send()
+            .await
+            .map_err(|e| AppError::Storage(format!("Failed to fetch GCP access token: {}", e)))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(AppError::Storage(format!(
+                "GCP metadata server returned {}: {}",
+                status, body
+            )));
+        }
+
+        let token_response: TokenResponse = response
+            .json()
+            .await
+            .map_err(|e| AppError::Storage(format!("Failed to parse GCP token response: {}", e)))?;
+
+        let expires_at = Instant::now() + Duration::from_secs(token_response.expires_in);
+        let token = token_response.access_token.clone();
+
+        *cache = Some(CachedToken {
+            token: token_response.access_token,
+            expires_at,
+        });
+
+        Ok(token)
     }
 
     /// Try to generate an Artifactory fallback path from a native path
@@ -190,13 +320,24 @@ impl GcsBackend {
             AppError::Config("GCS private key not configured for signed URLs".to_string())
         })?;
 
+        let service_account_email =
+            self.config
+                .service_account_email
+                .as_deref()
+                .ok_or_else(|| {
+                    AppError::Config(
+                        "GCS_SERVICE_ACCOUNT_EMAIL not configured (required for signed URLs)"
+                            .to_string(),
+                    )
+                })?;
+
         let now = Utc::now();
         let expiry_seconds = expires_in.as_secs().min(604800); // Max 7 days
 
         // Credential scope
         let date_stamp = now.format("%Y%m%d").to_string();
         let credential_scope = format!("{}/auto/storage/goog4_request", date_stamp);
-        let credential = format!("{}/{}", self.config.service_account_email, credential_scope);
+        let credential = format!("{}/{}", service_account_email, credential_scope);
 
         // Request timestamp
         let request_timestamp = now.format("%Y%m%dT%H%M%SZ").to_string();
@@ -259,21 +400,20 @@ impl GcsBackend {
 #[async_trait]
 impl StorageBackend for GcsBackend {
     async fn put(&self, key: &str, content: Bytes) -> Result<()> {
-        // For uploads, we need OAuth2 authentication or signed URLs
-        // This is a simplified implementation - in production, use google-cloud-storage crate
-        // or implement proper OAuth2 flow
-
-        // For now, we generate a signed URL for upload (PUT)
-        // Note: This requires the service account to have storage.objects.create permission
         let url = self.object_url(key);
 
-        // Generate upload signed URL (would need PUT permission in signing)
-        // For simplicity, this assumes the bucket allows uploads via some auth mechanism
-        let response = self
+        let mut request = self
             .client
             .put(&url)
             .header("Content-Type", "application/octet-stream")
-            .body(content.to_vec())
+            .body(content.to_vec());
+
+        if let AuthMode::Adc = self.auth_mode {
+            let token = self.get_token().await?;
+            request = request.header("Authorization", format!("Bearer {}", token));
+        }
+
+        let response = request
             .send()
             .await
             .map_err(|e| AppError::Storage(format!("GCS upload failed: {}", e)))?;
@@ -291,106 +431,228 @@ impl StorageBackend for GcsBackend {
     }
 
     async fn get(&self, key: &str) -> Result<Bytes> {
-        // For reads, generate a signed URL and fetch
-        let signed_url = self.generate_signed_url(key, Duration::from_secs(300))?;
+        match self.auth_mode {
+            AuthMode::RsaKey => {
+                // For reads, generate a signed URL and fetch
+                let signed_url = self.generate_signed_url(key, Duration::from_secs(300))?;
 
-        let response = self
-            .client
-            .get(&signed_url)
-            .send()
-            .await
-            .map_err(|e| AppError::Storage(format!("GCS download failed: {}", e)))?;
+                let response = self
+                    .client
+                    .get(&signed_url)
+                    .send()
+                    .await
+                    .map_err(|e| AppError::Storage(format!("GCS download failed: {}", e)))?;
 
-        if !response.status().is_success() {
-            let status = response.status();
-            if status == reqwest::StatusCode::NOT_FOUND {
-                // In migration mode, try Artifactory fallback path
-                if self.path_format.has_fallback() {
-                    if let Some(fallback_key) = self.try_artifactory_fallback(key) {
-                        tracing::debug!(
-                            original = %key,
-                            fallback = %fallback_key,
-                            "Trying Artifactory fallback path"
-                        );
-                        let fallback_url =
-                            self.generate_signed_url(&fallback_key, Duration::from_secs(300))?;
-                        let fallback_response =
-                            self.client.get(&fallback_url).send().await.map_err(|e| {
-                                AppError::Storage(format!("GCS fallback download failed: {}", e))
-                            })?;
+                if !response.status().is_success() {
+                    let status = response.status();
+                    if status == reqwest::StatusCode::NOT_FOUND {
+                        // In migration mode, try Artifactory fallback path
+                        if self.path_format.has_fallback() {
+                            if let Some(fallback_key) = self.try_artifactory_fallback(key) {
+                                tracing::debug!(
+                                    original = %key,
+                                    fallback = %fallback_key,
+                                    "Trying Artifactory fallback path"
+                                );
+                                let fallback_url = self
+                                    .generate_signed_url(&fallback_key, Duration::from_secs(300))?;
+                                let fallback_response =
+                                    self.client.get(&fallback_url).send().await.map_err(|e| {
+                                        AppError::Storage(format!(
+                                            "GCS fallback download failed: {}",
+                                            e
+                                        ))
+                                    })?;
 
-                        if fallback_response.status().is_success() {
-                            tracing::info!(
-                                key = %key,
-                                fallback = %fallback_key,
-                                "Found artifact at Artifactory fallback path"
-                            );
-                            let bytes = fallback_response.bytes().await.map_err(|e| {
-                                AppError::Storage(format!("Failed to read response: {}", e))
-                            })?;
-                            return Ok(bytes);
+                                if fallback_response.status().is_success() {
+                                    tracing::info!(
+                                        key = %key,
+                                        fallback = %fallback_key,
+                                        "Found artifact at Artifactory fallback path"
+                                    );
+                                    let bytes = fallback_response.bytes().await.map_err(|e| {
+                                        AppError::Storage(format!("Failed to read response: {}", e))
+                                    })?;
+                                    return Ok(bytes);
+                                }
+                            }
                         }
+                        return Err(AppError::NotFound(format!("Object not found: {}", key)));
                     }
+                    let body = response.text().await.unwrap_or_default();
+                    return Err(AppError::Storage(format!(
+                        "GCS download failed with status {}: {}",
+                        status, body
+                    )));
                 }
-                return Err(AppError::NotFound(format!("Object not found: {}", key)));
+
+                let bytes = response
+                    .bytes()
+                    .await
+                    .map_err(|e| AppError::Storage(format!("Failed to read response: {}", e)))?;
+
+                Ok(bytes)
             }
-            let body = response.text().await.unwrap_or_default();
-            return Err(AppError::Storage(format!(
-                "GCS download failed with status {}: {}",
-                status, body
-            )));
+            AuthMode::Adc => {
+                let token = self.get_token().await?;
+                let url = self.object_url(key);
+
+                let response = self
+                    .client
+                    .get(&url)
+                    .header("Authorization", format!("Bearer {}", token))
+                    .send()
+                    .await
+                    .map_err(|e| AppError::Storage(format!("GCS download failed: {}", e)))?;
+
+                if !response.status().is_success() {
+                    let status = response.status();
+                    if status == reqwest::StatusCode::NOT_FOUND {
+                        // In migration mode, try Artifactory fallback path
+                        if self.path_format.has_fallback() {
+                            if let Some(fallback_key) = self.try_artifactory_fallback(key) {
+                                tracing::debug!(
+                                    original = %key,
+                                    fallback = %fallback_key,
+                                    "Trying Artifactory fallback path"
+                                );
+                                let fallback_url = self.object_url(&fallback_key);
+                                let fallback_response = self
+                                    .client
+                                    .get(&fallback_url)
+                                    .header("Authorization", format!("Bearer {}", token))
+                                    .send()
+                                    .await
+                                    .map_err(|e| {
+                                        AppError::Storage(format!(
+                                            "GCS fallback download failed: {}",
+                                            e
+                                        ))
+                                    })?;
+
+                                if fallback_response.status().is_success() {
+                                    tracing::info!(
+                                        key = %key,
+                                        fallback = %fallback_key,
+                                        "Found artifact at Artifactory fallback path"
+                                    );
+                                    let bytes = fallback_response.bytes().await.map_err(|e| {
+                                        AppError::Storage(format!("Failed to read response: {}", e))
+                                    })?;
+                                    return Ok(bytes);
+                                }
+                            }
+                        }
+                        return Err(AppError::NotFound(format!("Object not found: {}", key)));
+                    }
+                    let body = response.text().await.unwrap_or_default();
+                    return Err(AppError::Storage(format!(
+                        "GCS download failed with status {}: {}",
+                        status, body
+                    )));
+                }
+
+                let bytes = response
+                    .bytes()
+                    .await
+                    .map_err(|e| AppError::Storage(format!("Failed to read response: {}", e)))?;
+
+                Ok(bytes)
+            }
         }
-
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|e| AppError::Storage(format!("Failed to read response: {}", e)))?;
-
-        Ok(bytes)
     }
 
     async fn exists(&self, key: &str) -> Result<bool> {
-        let signed_url = self.generate_signed_url(key, Duration::from_secs(60))?;
+        match self.auth_mode {
+            AuthMode::RsaKey => {
+                let signed_url = self.generate_signed_url(key, Duration::from_secs(60))?;
 
-        let response = self
-            .client
-            .head(&signed_url)
-            .send()
-            .await
-            .map_err(|e| AppError::Storage(format!("GCS HEAD request failed: {}", e)))?;
+                let response =
+                    self.client.head(&signed_url).send().await.map_err(|e| {
+                        AppError::Storage(format!("GCS HEAD request failed: {}", e))
+                    })?;
 
-        if response.status().is_success() {
-            return Ok(true);
-        }
+                if response.status().is_success() {
+                    return Ok(true);
+                }
 
-        // In migration mode, also check the Artifactory fallback path
-        if self.path_format.has_fallback() {
-            if let Some(fallback_key) = self.try_artifactory_fallback(key) {
-                let fallback_url =
-                    self.generate_signed_url(&fallback_key, Duration::from_secs(60))?;
-                let fallback_response = self.client.head(&fallback_url).send().await.ok();
-                if let Some(resp) = fallback_response {
-                    if resp.status().is_success() {
-                        tracing::debug!(
-                            key = %key,
-                            fallback = %fallback_key,
-                            "Found artifact at Artifactory fallback path"
-                        );
-                        return Ok(true);
+                // In migration mode, also check the Artifactory fallback path
+                if self.path_format.has_fallback() {
+                    if let Some(fallback_key) = self.try_artifactory_fallback(key) {
+                        let fallback_url =
+                            self.generate_signed_url(&fallback_key, Duration::from_secs(60))?;
+                        let fallback_response = self.client.head(&fallback_url).send().await.ok();
+                        if let Some(resp) = fallback_response {
+                            if resp.status().is_success() {
+                                tracing::debug!(
+                                    key = %key,
+                                    fallback = %fallback_key,
+                                    "Found artifact at Artifactory fallback path"
+                                );
+                                return Ok(true);
+                            }
+                        }
                     }
                 }
+
+                Ok(false)
+            }
+            AuthMode::Adc => {
+                let token = self.get_token().await?;
+                let url = self.object_url(key);
+
+                let response = self
+                    .client
+                    .head(&url)
+                    .header("Authorization", format!("Bearer {}", token))
+                    .send()
+                    .await
+                    .map_err(|e| AppError::Storage(format!("GCS HEAD request failed: {}", e)))?;
+
+                if response.status().is_success() {
+                    return Ok(true);
+                }
+
+                // In migration mode, also check the Artifactory fallback path
+                if self.path_format.has_fallback() {
+                    if let Some(fallback_key) = self.try_artifactory_fallback(key) {
+                        let fallback_url = self.object_url(&fallback_key);
+                        let fallback_response = self
+                            .client
+                            .head(&fallback_url)
+                            .header("Authorization", format!("Bearer {}", token))
+                            .send()
+                            .await
+                            .ok();
+                        if let Some(resp) = fallback_response {
+                            if resp.status().is_success() {
+                                tracing::debug!(
+                                    key = %key,
+                                    fallback = %fallback_key,
+                                    "Found artifact at Artifactory fallback path"
+                                );
+                                return Ok(true);
+                            }
+                        }
+                    }
+                }
+
+                Ok(false)
             }
         }
-
-        Ok(false)
     }
 
     async fn delete(&self, key: &str) -> Result<()> {
         let url = self.object_url(key);
 
-        let response = self
-            .client
-            .delete(&url)
+        let mut request = self.client.delete(&url);
+
+        if let AuthMode::Adc = self.auth_mode {
+            let token = self.get_token().await?;
+            request = request.header("Authorization", format!("Bearer {}", token));
+        }
+
+        let response = request
             .send()
             .await
             .map_err(|e| AppError::Storage(format!("GCS delete failed: {}", e)))?;
@@ -408,7 +670,9 @@ impl StorageBackend for GcsBackend {
     }
 
     fn supports_redirect(&self) -> bool {
-        self.config.redirect_downloads && self.signing_key.is_some()
+        matches!(self.auth_mode, AuthMode::RsaKey)
+            && self.config.redirect_downloads
+            && self.signing_key.is_some()
     }
 
     async fn get_presigned_url(
@@ -416,6 +680,11 @@ impl StorageBackend for GcsBackend {
         key: &str,
         expires_in: Duration,
     ) -> Result<Option<PresignedUrl>> {
+        // ADC mode never generates signed URLs
+        if let AuthMode::Adc = self.auth_mode {
+            return Ok(None);
+        }
+
         if !self.config.redirect_downloads {
             return Ok(None);
         }
@@ -451,8 +720,8 @@ mod tests {
     fn create_test_config() -> GcsConfig {
         GcsConfig {
             bucket: "test-bucket".to_string(),
-            project_id: "test-project".to_string(),
-            service_account_email: "test@test-project.iam.gserviceaccount.com".to_string(),
+            project_id: Some("test-project".to_string()),
+            service_account_email: Some("test@test-project.iam.gserviceaccount.com".to_string()),
             private_key: Some(TEST_PRIVATE_KEY.to_string()),
             redirect_downloads: true,
             signed_url_expiry: Duration::from_secs(3600),
@@ -692,7 +961,7 @@ mod tests {
         let config = create_test_config();
         let cloned = config.clone();
         assert_eq!(cloned.bucket, "test-bucket");
-        assert_eq!(cloned.project_id, "test-project");
+        assert_eq!(cloned.project_id, Some("test-project".to_string()));
         assert_eq!(cloned.service_account_email, config.service_account_email);
     }
 
@@ -708,4 +977,221 @@ mod tests {
             .unwrap();
         assert_eq!(presigned.expires_in, expires);
     }
+
+    // ---- from_env() tests ----
+
+    // Serialize env-var tests to avoid cross-test interference.
+    static ENV_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+
+    fn env_lock() -> &'static std::sync::Mutex<()> {
+        ENV_LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    #[test]
+    fn test_from_env_adc_mode_only_bucket() {
+        let _guard = env_lock().lock().unwrap();
+        std::env::remove_var("GCS_PROJECT_ID");
+        std::env::remove_var("GCS_SERVICE_ACCOUNT_EMAIL");
+        std::env::remove_var("GCS_PRIVATE_KEY");
+        std::env::remove_var("GCS_PRIVATE_KEY_PATH");
+        std::env::remove_var("GCS_REDIRECT_DOWNLOADS");
+        std::env::remove_var("GCS_SIGNED_URL_EXPIRY");
+        std::env::set_var("GCS_BUCKET", "adc-bucket");
+
+        let result = GcsConfig::from_env();
+        std::env::remove_var("GCS_BUCKET");
+
+        assert!(
+            result.is_ok(),
+            "ADC mode should succeed with only GCS_BUCKET"
+        );
+        let config = result.unwrap();
+        assert_eq!(config.bucket, "adc-bucket");
+        assert!(config.project_id.is_none());
+        assert!(config.service_account_email.is_none());
+        assert!(config.private_key.is_none());
+    }
+
+    #[test]
+    fn test_from_env_mode_a_full_config() {
+        let _guard = env_lock().lock().unwrap();
+        std::env::set_var("GCS_BUCKET", "my-bucket");
+        std::env::set_var(
+            "GCS_PRIVATE_KEY",
+            "-----BEGIN PRIVATE KEY-----\nfake\n-----END PRIVATE KEY-----",
+        );
+        std::env::set_var("GCS_PROJECT_ID", "my-project");
+        std::env::set_var(
+            "GCS_SERVICE_ACCOUNT_EMAIL",
+            "sa@my-project.iam.gserviceaccount.com",
+        );
+        std::env::remove_var("GCS_PRIVATE_KEY_PATH");
+
+        let result = GcsConfig::from_env();
+        std::env::remove_var("GCS_BUCKET");
+        std::env::remove_var("GCS_PRIVATE_KEY");
+        std::env::remove_var("GCS_PROJECT_ID");
+        std::env::remove_var("GCS_SERVICE_ACCOUNT_EMAIL");
+
+        // from_env() only reads and validates presence — key parsing happens in GcsBackend::new()
+        assert!(
+            result.is_ok(),
+            "Mode A full config should succeed in from_env"
+        );
+        let config = result.unwrap();
+        assert_eq!(config.bucket, "my-bucket");
+        assert_eq!(config.project_id, Some("my-project".to_string()));
+        assert!(config.private_key.is_some());
+    }
+
+    #[test]
+    fn test_from_env_fails_without_bucket() {
+        let _guard = env_lock().lock().unwrap();
+        std::env::remove_var("GCS_BUCKET");
+        std::env::remove_var("GCS_PRIVATE_KEY");
+        std::env::remove_var("GCS_PRIVATE_KEY_PATH");
+
+        let result = GcsConfig::from_env();
+        assert!(result.is_err(), "Should fail without GCS_BUCKET");
+    }
+
+    #[test]
+    fn test_from_env_fails_mode_a_without_project_id() {
+        let _guard = env_lock().lock().unwrap();
+        std::env::set_var("GCS_BUCKET", "my-bucket");
+        std::env::set_var("GCS_PRIVATE_KEY", "some-key");
+        std::env::remove_var("GCS_PRIVATE_KEY_PATH");
+        std::env::remove_var("GCS_PROJECT_ID");
+        std::env::set_var(
+            "GCS_SERVICE_ACCOUNT_EMAIL",
+            "sa@my-project.iam.gserviceaccount.com",
+        );
+
+        let result = GcsConfig::from_env();
+        std::env::remove_var("GCS_BUCKET");
+        std::env::remove_var("GCS_PRIVATE_KEY");
+        std::env::remove_var("GCS_SERVICE_ACCOUNT_EMAIL");
+
+        assert!(result.is_err(), "Mode A should fail without GCS_PROJECT_ID");
+    }
+
+    #[test]
+    fn test_from_env_fails_mode_a_without_service_account_email() {
+        let _guard = env_lock().lock().unwrap();
+        std::env::set_var("GCS_BUCKET", "my-bucket");
+        std::env::set_var("GCS_PRIVATE_KEY", "some-key");
+        std::env::remove_var("GCS_PRIVATE_KEY_PATH");
+        std::env::set_var("GCS_PROJECT_ID", "my-project");
+        std::env::remove_var("GCS_SERVICE_ACCOUNT_EMAIL");
+
+        let result = GcsConfig::from_env();
+        std::env::remove_var("GCS_BUCKET");
+        std::env::remove_var("GCS_PRIVATE_KEY");
+        std::env::remove_var("GCS_PROJECT_ID");
+
+        assert!(
+            result.is_err(),
+            "Mode A should fail without GCS_SERVICE_ACCOUNT_EMAIL"
+        );
+    }
+
+    // ---- ADC mode struct / behaviour tests ----
+
+    #[tokio::test]
+    async fn test_adc_mode_supports_redirect_false() {
+        let config = GcsConfig {
+            bucket: "test-bucket".to_string(),
+            project_id: None,
+            service_account_email: None,
+            private_key: None,
+            redirect_downloads: true,
+            signed_url_expiry: Duration::from_secs(3600),
+            path_format: StoragePathFormat::Native,
+        };
+        let backend = GcsBackend::new(config).await.unwrap();
+        assert!(
+            !backend.supports_redirect(),
+            "ADC mode must never return true for supports_redirect"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mode_a_supports_redirect_with_key_and_flag() {
+        // create_test_config() has redirect_downloads: true and a valid private key
+        let backend = GcsBackend::new(create_test_config()).await.unwrap();
+        assert!(
+            backend.supports_redirect(),
+            "Mode A with key and redirect_downloads=true should support redirect"
+        );
+    }
+
+    /// Token cache validity logic: tokens are considered fresh only when they expire
+    /// more than 60 seconds from now. This test exercises the condition without making
+    /// any network calls.
+    #[test]
+    fn test_token_cache_validity() {
+        // A token expiring in 120s has >60s buffer → valid
+        let valid = CachedToken {
+            token: "ya29.valid".to_string(),
+            expires_at: Instant::now() + Duration::from_secs(120),
+        };
+        assert!(
+            valid.expires_at > Instant::now() + Duration::from_secs(60),
+            "Token with 120s remaining should be considered valid"
+        );
+
+        // A token expiring in 30s has <60s buffer → needs refresh
+        let expiring = CachedToken {
+            token: "ya29.expiring".to_string(),
+            expires_at: Instant::now() + Duration::from_secs(30),
+        };
+        assert!(
+            expiring.expires_at <= Instant::now() + Duration::from_secs(60),
+            "Token with 30s remaining should trigger a refresh"
+        );
+
+        // An already-expired token also needs refresh
+        let expired = CachedToken {
+            token: "ya29.expired".to_string(),
+            expires_at: Instant::now() - Duration::from_secs(1),
+        };
+        assert!(
+            expired.expires_at <= Instant::now() + Duration::from_secs(60),
+            "Expired token should trigger a refresh"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_adc_mode_get_presigned_url_returns_none() {
+        let config = GcsConfig {
+            bucket: "test-bucket".to_string(),
+            project_id: None,
+            service_account_email: None,
+            private_key: None,
+            // Even with redirect enabled, ADC mode returns None
+            redirect_downloads: true,
+            signed_url_expiry: Duration::from_secs(3600),
+            path_format: StoragePathFormat::Native,
+        };
+        let backend = GcsBackend::new(config).await.unwrap();
+        let result = backend
+            .get_presigned_url("test.txt", Duration::from_secs(3600))
+            .await
+            .unwrap();
+        assert!(
+            result.is_none(),
+            "ADC mode get_presigned_url must return None"
+        );
+    }
+
+    /// A live integration test for `get_token()` would verify that the backend sends
+    /// `GET http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token`
+    /// with the `Metadata-Flavor: Google` header, parses the JSON response, and stores
+    /// the token in `token_cache` with an expiry derived from `expires_in`. It would
+    /// also verify that a second call within the cache window reuses the stored token
+    /// without making another HTTP request. This test is omitted here because it
+    /// requires either a live GKE/Workload Identity environment or an HTTP mock server
+    /// pointed at a configurable URL.
+    #[allow(dead_code)]
+    fn _doc_get_token_integration_test() {}
 }
