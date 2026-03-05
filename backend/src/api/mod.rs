@@ -20,10 +20,46 @@ use crate::services::repository_service::RepositoryService;
 use crate::services::scanner_service::ScannerService;
 use crate::services::wasm_plugin_service::WasmPluginService;
 use crate::storage::StorageBackend;
+use bytes::Bytes;
 use metrics_exporter_prometheus::PrometheusHandle;
 use sqlx::PgPool;
+use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
+use std::time::Instant;
+use uuid::Uuid;
+
+// ---------------------------------------------------------------------------
+// Repository info cache — shared between repo_visibility_middleware and
+// format-handler resolvers to eliminate duplicate DB lookups per request.
+// ---------------------------------------------------------------------------
+
+/// How long a cached repository record is considered fresh.
+/// Repository metadata (visibility, type, upstream URL) rarely changes, so
+/// 60 seconds is a safe balance between performance and propagation speed.
+pub const REPO_CACHE_TTL_SECS: u64 = 60;
+
+/// Cached repository metadata populated by the repo-visibility middleware
+/// and reused by format-handler resolvers to avoid a second DB round-trip.
+#[derive(Clone, Debug)]
+pub struct CachedRepo {
+    pub id: Uuid,
+    pub format: String,
+    pub repo_type: String,
+    pub upstream_url: Option<String>,
+    pub storage_path: String,
+    pub is_public: bool,
+    /// The `index_upstream_url` config value (cargo-specific; `None` for
+    /// other formats or when not configured).
+    pub index_upstream_url: Option<String>,
+}
+
+/// Thread-safe in-process cache for `CachedRepo` entries, keyed by repo key.
+pub type RepoCache = Arc<RwLock<HashMap<String, (CachedRepo, Instant)>>>;
+
+/// Thread-safe in-process cache for rendered cargo sparse-index entries.
+/// Key: `"{repo_key}:{crate_name_lowercase}"`. Value: raw response bytes + insertion time.
+pub type IndexCache = Arc<RwLock<HashMap<String, (Bytes, Instant)>>>;
 
 /// Application state shared across handlers
 #[derive(Clone)]
@@ -42,6 +78,13 @@ pub struct AppState {
     /// When true, most API endpoints return 403 until the admin changes the default password.
     pub setup_required: Arc<AtomicBool>,
     pub event_bus: Arc<EventBus>,
+    /// Short-lived in-process cache of repository metadata, shared between
+    /// the repo-visibility middleware and format-handler resolvers.
+    pub repo_cache: RepoCache,
+    /// In-process cache of rendered cargo sparse-index entries, keyed by
+    /// `"{repo_key}:{crate_name_lowercase}"`. Eliminates storage I/O and
+    /// SHA-256 re-verification on every warm index request.
+    pub index_cache: IndexCache,
 }
 
 impl AppState {
@@ -60,6 +103,8 @@ impl AppState {
             metrics_handle: None,
             setup_required: Arc::new(AtomicBool::new(false)),
             event_bus: Arc::new(EventBus::new(1024)),
+            repo_cache: Arc::new(RwLock::new(HashMap::new())),
+            index_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -85,6 +130,8 @@ impl AppState {
             metrics_handle: None,
             setup_required: Arc::new(AtomicBool::new(false)),
             event_bus: Arc::new(EventBus::new(1024)),
+            repo_cache: Arc::new(RwLock::new(HashMap::new())),
+            index_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 

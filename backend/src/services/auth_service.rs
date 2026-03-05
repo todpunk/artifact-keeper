@@ -2,7 +2,9 @@
 //!
 //! Handles user authentication, JWT token management, and password hashing.
 
-use std::sync::{Arc, OnceLock};
+use std::collections::HashMap;
+use std::sync::{Arc, OnceLock, RwLock};
+use std::time::Instant;
 
 use bcrypt::{hash, verify, DEFAULT_COST};
 use chrono::{DateTime, Duration, Utc};
@@ -77,12 +79,22 @@ pub struct TokenPair {
     pub expires_in: u64,
 }
 
+/// How long a validated API token result is kept in the in-memory cache before
+/// the full DB + bcrypt verification is repeated.  Five minutes balances
+/// performance (cargo makes ~40 authenticated requests per build) against
+/// revocation latency (a revoked token remains valid at most this long).
+const API_TOKEN_CACHE_TTL_SECS: u64 = 300;
+
 /// Authentication service
 pub struct AuthService {
     db: PgPool,
     config: Arc<Config>,
     encoding_key: EncodingKey,
     decoding_key: DecodingKey,
+    /// In-memory cache of recently validated API tokens.  Avoids repeating the
+    /// expensive bcrypt verification on every request (cargo sends credentials
+    /// on every index and download request).
+    token_cache: RwLock<HashMap<String, (ApiTokenValidation, Instant)>>,
 }
 
 impl AuthService {
@@ -94,6 +106,7 @@ impl AuthService {
             config,
             encoding_key: EncodingKey::from_secret(secret.as_bytes()),
             decoding_key: DecodingKey::from_secret(secret.as_bytes()),
+            token_cache: RwLock::new(HashMap::new()),
         }
     }
 
@@ -266,6 +279,19 @@ impl AuthService {
 
     /// Validate API token and return user with scopes and repository restrictions.
     pub async fn validate_api_token(&self, token: &str) -> Result<ApiTokenValidation> {
+        // Check in-memory cache before the expensive bcrypt verification.
+        // Package managers like cargo send credentials on every request (index
+        // lookups, downloads, etc.), so without caching every request pays the
+        // full bcrypt cost (~100-500 ms), which compounds across the many
+        // parallel requests in a single build.
+        if let Ok(cache) = self.token_cache.read() {
+            if let Some((cached, cached_at)) = cache.get(token) {
+                if cached_at.elapsed().as_secs() < API_TOKEN_CACHE_TTL_SECS {
+                    return Ok(cached.clone());
+                }
+            }
+        }
+
         // API tokens have format: prefix_secret
         // We store hash of full token and prefix for lookup
         let dummy = Self::dummy_bcrypt_hash();
@@ -386,11 +412,19 @@ impl AuthService {
             }
         };
 
-        Ok(ApiTokenValidation {
+        let validation = ApiTokenValidation {
             user,
             scopes: stored_token.scopes,
             allowed_repo_ids,
-        })
+        };
+
+        // Populate cache; evict stale entries on write to keep memory bounded.
+        if let Ok(mut cache) = self.token_cache.write() {
+            cache.retain(|_, (_, at)| at.elapsed().as_secs() < API_TOKEN_CACHE_TTL_SECS);
+            cache.insert(token.to_string(), (validation.clone(), Instant::now()));
+        }
+
+        Ok(validation)
     }
 
     /// Generate a new API token
