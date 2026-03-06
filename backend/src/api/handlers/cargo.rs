@@ -149,12 +149,18 @@ async fn resolve_cargo_repo(
     }
 
     // Cache miss (e.g. direct access bypassing the middleware): fall back to
-    // the original two-query DB path and populate the cache for next time.
-    let repo = sqlx::query!(
-        r#"SELECT id, storage_path, format::text as "format!", repo_type::text as "repo_type!", upstream_url
-        FROM repositories WHERE key = $1"#,
-        repo_key
+    // a DB lookup and populate the cache for next time.  Uses sqlx::query()
+    // (not the macro) so no offline-cache update is needed.
+    use sqlx::Row;
+    let repo = sqlx::query(
+        "SELECT id, storage_path, format::text as format, repo_type::text as repo_type, \
+         upstream_url, is_public, \
+         (SELECT value FROM repository_config \
+          WHERE repository_id = repositories.id \
+          AND key = 'index_upstream_url') AS index_upstream_url \
+         FROM repositories WHERE key = $1",
     )
+    .bind(repo_key)
     .fetch_optional(db)
     .await
     .map_err(|e| {
@@ -166,7 +172,8 @@ async fn resolve_cargo_repo(
     })?
     .ok_or_else(|| (StatusCode::NOT_FOUND, "Repository not found").into_response())?;
 
-    let fmt = repo.format.to_lowercase();
+    let fmt: String = repo.get("format");
+    let fmt = fmt.to_lowercase();
     if fmt != "cargo" {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -178,20 +185,12 @@ async fn resolve_cargo_repo(
             .into_response());
     }
 
-    let index_upstream_url: Option<String> = sqlx::query_scalar(
-        "SELECT value FROM repository_config WHERE repository_id = $1 AND key = 'index_upstream_url'",
-    )
-    .bind(repo.id)
-    .fetch_optional(db)
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Database error: {}", e),
-        )
-            .into_response()
-    })?
-    .flatten();
+    let id: uuid::Uuid = repo.get("id");
+    let storage_path: String = repo.get("storage_path");
+    let repo_type: String = repo.get("repo_type");
+    let upstream_url: Option<String> = repo.get("upstream_url");
+    let is_public: bool = repo.get("is_public");
+    let index_upstream_url: Option<String> = repo.get("index_upstream_url");
 
     // Populate cache so subsequent requests from this handler path are fast.
     if let Ok(mut cache) = repo_cache.write() {
@@ -200,12 +199,12 @@ async fn resolve_cargo_repo(
             repo_key.to_string(),
             (
                 CachedRepo {
-                    id: repo.id,
-                    format: repo.format.clone(),
-                    repo_type: repo.repo_type.clone(),
-                    upstream_url: repo.upstream_url.clone(),
-                    storage_path: repo.storage_path.clone(),
-                    is_public: false, // unknown here; middleware sets the real value
+                    id,
+                    format: fmt.clone(),
+                    repo_type: repo_type.clone(),
+                    upstream_url: upstream_url.clone(),
+                    storage_path: storage_path.clone(),
+                    is_public,
                     index_upstream_url: index_upstream_url.clone(),
                 },
                 Instant::now(),
@@ -214,10 +213,10 @@ async fn resolve_cargo_repo(
     }
 
     Ok(RepoInfo {
-        id: repo.id,
-        storage_path: repo.storage_path,
-        repo_type: repo.repo_type,
-        upstream_url: repo.upstream_url,
+        id,
+        storage_path,
+        repo_type,
+        upstream_url,
         index_upstream_url,
     })
 }

@@ -10,6 +10,7 @@ use bcrypt::{hash, verify, DEFAULT_COST};
 use chrono::{DateTime, Duration, Utc};
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, TokenData, Validation};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -279,13 +280,17 @@ impl AuthService {
 
     /// Validate API token and return user with scopes and repository restrictions.
     pub async fn validate_api_token(&self, token: &str) -> Result<ApiTokenValidation> {
+        // Hash the raw token before using it as cache key so plaintext tokens
+        // are never stored in memory.
+        let cache_key = format!("{:x}", Sha256::digest(token.as_bytes()));
+
         // Check in-memory cache before the expensive bcrypt verification.
         // Package managers like cargo send credentials on every request (index
         // lookups, downloads, etc.), so without caching every request pays the
         // full bcrypt cost (~100-500 ms), which compounds across the many
         // parallel requests in a single build.
         if let Ok(cache) = self.token_cache.read() {
-            if let Some((cached, cached_at)) = cache.get(token) {
+            if let Some((cached, cached_at)) = cache.get(&cache_key) {
                 if cached_at.elapsed().as_secs() < API_TOKEN_CACHE_TTL_SECS {
                     return Ok(cached.clone());
                 }
@@ -421,7 +426,7 @@ impl AuthService {
         // Populate cache; evict stale entries on write to keep memory bounded.
         if let Ok(mut cache) = self.token_cache.write() {
             cache.retain(|_, (_, at)| at.elapsed().as_secs() < API_TOKEN_CACHE_TTL_SECS);
-            cache.insert(token.to_string(), (validation.clone(), Instant::now()));
+            cache.insert(cache_key, (validation.clone(), Instant::now()));
         }
 
         Ok(validation)
