@@ -1641,4 +1641,141 @@ mod tests {
             err
         );
     }
+
+    // -----------------------------------------------------------------------
+    // API token cache key hashing
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_token_cache_key_is_sha256_hex() {
+        let token = "ak_12345678_secret_token_value";
+        let key = format!("{:x}", Sha256::digest(token.as_bytes()));
+        // SHA-256 hex output is always 64 characters
+        assert_eq!(key.len(), 64);
+        // Must be lowercase hex
+        assert!(key.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn test_token_cache_key_deterministic() {
+        let token = "ak_abcdefgh_my_token";
+        let k1 = format!("{:x}", Sha256::digest(token.as_bytes()));
+        let k2 = format!("{:x}", Sha256::digest(token.as_bytes()));
+        assert_eq!(k1, k2);
+    }
+
+    #[test]
+    fn test_token_cache_key_different_tokens_produce_different_keys() {
+        let k1 = format!("{:x}", Sha256::digest(b"ak_aaaaaaaa_token1"));
+        let k2 = format!("{:x}", Sha256::digest(b"ak_bbbbbbbb_token2"));
+        assert_ne!(k1, k2);
+    }
+
+    #[test]
+    fn test_token_cache_key_does_not_contain_raw_token() {
+        let token = "ak_12345678_very_secret";
+        let key = format!("{:x}", Sha256::digest(token.as_bytes()));
+        assert!(!key.contains("ak_12345678"));
+        assert!(!key.contains("very_secret"));
+    }
+
+    #[test]
+    fn test_api_token_cache_ttl_constant() {
+        assert_eq!(API_TOKEN_CACHE_TTL_SECS, 300);
+    }
+
+    #[test]
+    fn test_token_cache_construction() {
+        // Verify the token_cache field can be constructed and used
+        let cache: RwLock<HashMap<String, (ApiTokenValidation, Instant)>> =
+            RwLock::new(HashMap::new());
+        assert!(cache.read().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_token_cache_insert_and_read() {
+        let cache: RwLock<HashMap<String, (ApiTokenValidation, Instant)>> =
+            RwLock::new(HashMap::new());
+        let key = format!("{:x}", Sha256::digest(b"ak_testtest_token"));
+        let validation = ApiTokenValidation {
+            user: User {
+                id: Uuid::nil(),
+                username: "testuser".to_string(),
+                email: "test@example.com".to_string(),
+                password_hash: None,
+                display_name: None,
+                auth_provider: AuthProvider::Local,
+                external_id: None,
+                is_admin: false,
+                is_active: true,
+                is_service_account: false,
+                must_change_password: false,
+                totp_secret: None,
+                totp_enabled: false,
+                totp_backup_codes: None,
+                totp_verified_at: None,
+                last_login_at: None,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            },
+            scopes: vec!["read:artifacts".to_string()],
+            allowed_repo_ids: None,
+        };
+        cache
+            .write()
+            .unwrap()
+            .insert(key.clone(), (validation.clone(), Instant::now()));
+
+        let guard = cache.read().unwrap();
+        let (cached, at) = guard.get(&key).unwrap();
+        assert_eq!(cached.user.username, "testuser");
+        assert!(at.elapsed().as_secs() < API_TOKEN_CACHE_TTL_SECS);
+    }
+
+    #[test]
+    fn test_token_cache_eviction() {
+        let cache: RwLock<HashMap<String, (ApiTokenValidation, Instant)>> =
+            RwLock::new(HashMap::new());
+        let key = format!("{:x}", Sha256::digest(b"ak_stalekey_token"));
+        let validation = ApiTokenValidation {
+            user: User {
+                id: Uuid::nil(),
+                username: "stale".to_string(),
+                email: "stale@example.com".to_string(),
+                password_hash: None,
+                display_name: None,
+                auth_provider: AuthProvider::Local,
+                external_id: None,
+                is_admin: false,
+                is_active: true,
+                is_service_account: false,
+                must_change_password: false,
+                totp_secret: None,
+                totp_enabled: false,
+                totp_backup_codes: None,
+                totp_verified_at: None,
+                last_login_at: None,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            },
+            scopes: vec![],
+            allowed_repo_ids: None,
+        };
+
+        // Insert with a backdated timestamp
+        let expired_at =
+            Instant::now() - std::time::Duration::from_secs(API_TOKEN_CACHE_TTL_SECS + 1);
+        cache
+            .write()
+            .unwrap()
+            .insert(key.clone(), (validation, expired_at));
+
+        // Evict stale entries
+        cache
+            .write()
+            .unwrap()
+            .retain(|_, (_, at)| at.elapsed().as_secs() < API_TOKEN_CACHE_TTL_SECS);
+
+        assert!(cache.read().unwrap().get(&key).is_none());
+    }
 }

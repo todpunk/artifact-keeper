@@ -199,3 +199,121 @@ impl AppState {
 }
 
 pub type SharedState = Arc<AppState>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_cached_repo() -> CachedRepo {
+        CachedRepo {
+            id: Uuid::nil(),
+            format: "cargo".to_string(),
+            repo_type: "hosted".to_string(),
+            upstream_url: None,
+            storage_path: "/data/repos/my-repo".to_string(),
+            is_public: true,
+            index_upstream_url: None,
+        }
+    }
+
+    #[test]
+    fn test_cached_repo_clone() {
+        let original = make_cached_repo();
+        let cloned = original.clone();
+        assert_eq!(cloned.id, original.id);
+        assert_eq!(cloned.format, original.format);
+        assert_eq!(cloned.is_public, original.is_public);
+        assert_eq!(cloned.storage_path, original.storage_path);
+    }
+
+    #[test]
+    fn test_cached_repo_debug() {
+        let repo = make_cached_repo();
+        let debug = format!("{:?}", repo);
+        assert!(debug.contains("cargo"));
+        assert!(debug.contains("hosted"));
+    }
+
+    #[test]
+    fn test_cached_repo_with_upstream() {
+        let repo = CachedRepo {
+            upstream_url: Some("https://crates.io".to_string()),
+            index_upstream_url: Some("https://index.crates.io".to_string()),
+            ..make_cached_repo()
+        };
+        assert_eq!(repo.upstream_url.as_deref(), Some("https://crates.io"));
+        assert_eq!(
+            repo.index_upstream_url.as_deref(),
+            Some("https://index.crates.io")
+        );
+    }
+
+    #[test]
+    fn test_repo_cache_ttl_constant() {
+        assert_eq!(REPO_CACHE_TTL_SECS, 60);
+    }
+
+    #[test]
+    fn test_repo_cache_insert_and_lookup() {
+        let cache: RepoCache = Arc::new(RwLock::new(HashMap::new()));
+        let repo = make_cached_repo();
+        cache
+            .write()
+            .unwrap()
+            .insert("my-repo".to_string(), (repo.clone(), Instant::now()));
+
+        let guard = cache.read().unwrap();
+        let (entry, at) = guard.get("my-repo").unwrap();
+        assert_eq!(entry.id, repo.id);
+        assert!(at.elapsed().as_secs() < REPO_CACHE_TTL_SECS);
+    }
+
+    #[test]
+    fn test_repo_cache_eviction_on_write() {
+        let cache: RepoCache = Arc::new(RwLock::new(HashMap::new()));
+        let repo = make_cached_repo();
+
+        // Insert an entry with a backdated timestamp (simulate expiry).
+        let expired_at = Instant::now() - std::time::Duration::from_secs(REPO_CACHE_TTL_SECS + 1);
+        cache
+            .write()
+            .unwrap()
+            .insert("stale".to_string(), (repo.clone(), expired_at));
+
+        // Insert a fresh entry and run eviction.
+        {
+            let mut w = cache.write().unwrap();
+            w.retain(|_, (_, at)| at.elapsed().as_secs() < REPO_CACHE_TTL_SECS);
+            w.insert("fresh".to_string(), (repo, Instant::now()));
+        }
+
+        let guard = cache.read().unwrap();
+        assert!(
+            guard.get("stale").is_none(),
+            "stale entry should be evicted"
+        );
+        assert!(guard.get("fresh").is_some(), "fresh entry should remain");
+    }
+
+    #[test]
+    fn test_repo_cache_miss_returns_none() {
+        let cache: RepoCache = Arc::new(RwLock::new(HashMap::new()));
+        let guard = cache.read().unwrap();
+        assert!(guard.get("nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_index_cache_type_construction() {
+        let cache: IndexCache = Arc::new(RwLock::new(HashMap::new()));
+        assert!(cache.read().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_cached_repo_private_visibility() {
+        let repo = CachedRepo {
+            is_public: false,
+            ..make_cached_repo()
+        };
+        assert!(!repo.is_public);
+    }
+}
