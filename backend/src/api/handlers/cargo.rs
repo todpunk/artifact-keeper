@@ -232,6 +232,14 @@ async fn config_json(
 ) -> Result<Response, Response> {
     let _repo = resolve_cargo_repo(&state.db, &repo_key, &state.repo_cache).await?;
 
+    // Check repo visibility from the cache (populated by resolve_cargo_repo).
+    let is_private = !state
+        .repo_cache
+        .read()
+        .ok()
+        .and_then(|c| c.get(&repo_key).map(|(r, _)| r.is_public))
+        .unwrap_or(true);
+
     // Determine the host from the request headers or fall back to config
     let host = headers
         .get("host")
@@ -248,10 +256,12 @@ async fn config_json(
     let config = serde_json::json!({
         "dl": format!("{}/cargo/{}/api/v1/crates", base_url, repo_key),
         "api": format!("{}/cargo/{}", base_url, repo_key),
-        // Tell cargo to send credentials on all requests (index fetches included).
-        // Without this flag, cargo only sends auth after a 401 challenge, but it
-        // does not retry 401s on index entries — causing "got 401" failures.
-        "auth-required": true,
+        // For private repos, tell cargo to send credentials on all requests
+        // (index fetches included).  Without this flag cargo only sends auth
+        // after a 401 challenge, but it does not retry 401s on index entries.
+        // Public repos must NOT set this, otherwise anonymous users need a
+        // credential provider configured even though the server allows access.
+        "auth-required": is_private,
     });
 
     Ok(Response::builder()
